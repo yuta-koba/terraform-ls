@@ -14,6 +14,7 @@ import (
 
 	"github.com/creachadair/jrpc2"
 	"github.com/creachadair/jrpc2/channel"
+	"github.com/creachadair/jrpc2/server"
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/terraform-ls/langserver/svcctl"
 )
@@ -23,7 +24,7 @@ type langServerMock struct {
 	logger *log.Logger
 
 	// rpcSrv is set when server starts and allows Stop() to stop it after testing is finished
-	rpcSrv *singleServer
+	rpcSrv *server.Simple
 
 	srvStopFunc    context.CancelFunc
 	stopFuncCalled bool
@@ -82,15 +83,12 @@ func (lsm *langServerMock) StopFuncCalled() bool {
 func (lsm *langServerMock) Start(t *testing.T) context.CancelFunc {
 	lsm.logger.Println("Starting mock server ...")
 
-	srv, err := lsm.srv.startServer(lsm.srvStdin, lsm.srvStdout)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	srv := lsm.srv.newServer()
 	lsm.rpcSrv = srv
 
 	go func() {
-		lsm.rpcSrv.Wait()
+		ch := channel.LSP(lsm.srvStdin, lsm.srvStdout)
+		lsm.rpcSrv.Run(ch)
 	}()
 
 	clientCh := channel.LSP(lsm.clientStdin, lsm.clientStdout)
