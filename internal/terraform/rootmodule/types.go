@@ -5,19 +5,20 @@ import (
 	"log"
 	"time"
 
+	"github.com/hashicorp/hcl-lang/decoder"
+	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/terraform-config-inspect/tfconfig"
 	"github.com/hashicorp/terraform-ls/internal/terraform/exec"
-	"github.com/hashicorp/terraform-ls/internal/terraform/lang"
 )
 
 type File interface {
 	Path() string
 }
 
-type ParserFinder interface {
-	ParserForDir(path string) (lang.Parser, error)
-	IsParserLoaded(path string) (bool, error)
-	IsSchemaLoaded(path string) (bool, error)
+type DecoderFinder interface {
+	DecoderForDir(path string) (*decoder.Decoder, error)
+	IsCoreSchemaLoaded(path string) (bool, error)
+	IsProviderSchemaLoaded(path string) (bool, error)
 }
 
 type TerraformFormatterFinder interface {
@@ -32,7 +33,7 @@ type RootModuleCandidateFinder interface {
 type RootModuleLoader func(dir string) (RootModule, error)
 
 type RootModuleManager interface {
-	ParserFinder
+	DecoderFinder
 	TerraformFormatterFinder
 	RootModuleCandidateFinder
 
@@ -70,12 +71,12 @@ type RootModule interface {
 	IsKnownPluginLockFile(path string) bool
 	IsKnownModuleManifestFile(path string) bool
 	PathsToWatch() []string
-	UpdateSchemaCache(ctx context.Context, lockFile File) error
-	ParseProviderReferences() error
-	IsSchemaLoaded() bool
+	UpdateProviderSchemaCache(ctx context.Context, lockFile File) error
+	IsProviderSchemaLoaded() bool
 	UpdateModuleManifest(manifestFile File) error
-	Parser() (lang.Parser, error)
-	IsParserLoaded() bool
+	Decoder() (*decoder.Decoder, error)
+	DecodeFiles() (hcl.Diagnostics, error)
+	IsCoreSchemaLoaded() bool
 	TerraformFormatter() (exec.Formatter, error)
 	IsTerraformLoaded() bool
 	Modules() []ModuleRecord

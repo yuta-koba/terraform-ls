@@ -13,12 +13,15 @@ import (
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/hcl-lang/decoder"
+	"github.com/hashicorp/hcl-lang/schema"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/terraform-config-inspect/tfconfig"
-	"github.com/hashicorp/terraform-ls/internal/terraform/addrs"
+	tfjson "github.com/hashicorp/terraform-json"
 	"github.com/hashicorp/terraform-ls/internal/terraform/discovery"
 	"github.com/hashicorp/terraform-ls/internal/terraform/exec"
-	"github.com/hashicorp/terraform-ls/internal/terraform/lang"
-	"github.com/hashicorp/terraform-ls/internal/terraform/schema"
+	tfschema "github.com/hashicorp/terraform-schema/schema"
 )
 
 type rootModule struct {
@@ -38,13 +41,11 @@ type rootModule struct {
 	moduleManifestFile File
 	moduleManifest     *moduleManifest
 
-	// plugin cache
+	// plugin (provider schema) cache
 	pluginMu         *sync.RWMutex
 	pluginLockFile   File
-	newSchemaStorage schema.StorageFactory
-	schemaStorage    *schema.Storage
-	schemaLoaded     bool
-	schemaLoadedMu   *sync.RWMutex
+	providerSchema   *tfjson.ProviderSchemas
+	providerSchemaMu *sync.RWMutex
 
 	// terraform executor
 	tfLoaded      bool
@@ -61,31 +62,30 @@ type rootModule struct {
 	tfVersion    *version.Version
 	tfVersionErr error
 
-	// language parser
-	parserLoaded bool
-	parserMu     *sync.RWMutex
-	parser       lang.Parser
+	// core schema
+	coreSchemaLoaded bool
+	coreSchema       *schema.BodySchema
+	coreSchemaMu     *sync.RWMutex
 
-	// provider references
-	filesystem     tfconfig.FS
-	providerRefs   addrs.ProviderReferences
-	providerRefsMu *sync.RWMutex
+	// decoder
+	decoder    *decoder.Decoder
+	decoderMu  *sync.RWMutex
+	filesystem tfconfig.FS
 }
 
 func newRootModule(fs tfconfig.FS, dir string) *rootModule {
 	return &rootModule{
-		path:           dir,
-		filesystem:     fs,
-		logger:         defaultLogger,
-		providerRefs:   make(addrs.ProviderReferences, 0),
-		providerRefsMu: &sync.RWMutex{},
-		isLoadingMu:    &sync.RWMutex{},
-		loadErrMu:      &sync.RWMutex{},
-		moduleMu:       &sync.RWMutex{},
-		pluginMu:       &sync.RWMutex{},
-		schemaLoadedMu: &sync.RWMutex{},
-		tfLoadedMu:     &sync.RWMutex{},
-		parserMu:       &sync.RWMutex{},
+		path:             dir,
+		filesystem:       fs,
+		logger:           defaultLogger,
+		isLoadingMu:      &sync.RWMutex{},
+		loadErrMu:        &sync.RWMutex{},
+		moduleMu:         &sync.RWMutex{},
+		pluginMu:         &sync.RWMutex{},
+		providerSchemaMu: &sync.RWMutex{},
+		tfLoadedMu:       &sync.RWMutex{},
+		coreSchemaMu:     &sync.RWMutex{},
+		decoderMu:        &sync.RWMutex{},
 	}
 }
 
@@ -98,7 +98,6 @@ func NewRootModule(ctx context.Context, fs tfconfig.FS, dir string) (RootModule,
 	rm.tfDiscoFunc = d.LookPath
 
 	rm.tfNewExecutor = exec.NewExecutor
-	rm.newSchemaStorage = schema.NewStorageForVersion
 
 	err := rm.discoverCaches(ctx, dir)
 	if err != nil {
@@ -218,16 +217,10 @@ func (rm *rootModule) load(ctx context.Context) error {
 	rm.tfVersionErr = err
 	errs = multierror.Append(errs, err)
 
-	err = rm.ParseProviderReferences()
+	err = rm.findCoreSchema()
 	errs = multierror.Append(errs, err)
 
-	err = rm.findCompatibleLangParser()
-	errs = multierror.Append(errs, err)
-
-	err = rm.findCompatibleStateStorage()
-	errs = multierror.Append(errs, err)
-
-	err = rm.UpdateSchemaCache(ctx, rm.pluginLockFile)
+	err = rm.UpdateProviderSchemaCache(ctx, rm.pluginLockFile)
 	errs = multierror.Append(errs, err)
 
 	rm.logger.Printf("loading of root module %s finished: %s",
@@ -296,89 +289,26 @@ func (rm *rootModule) discoverTerraformVersion(ctx context.Context) error {
 	return nil
 }
 
-func (rm *rootModule) findCompatibleStateStorage() error {
-	if rm.tfVersion == nil {
-		return errors.New("unknown terraform version - unable to find state storage")
-	}
-
-	ss, err := rm.newSchemaStorage(rm.tfVersion)
-	if err != nil {
-		return err
-	}
-	rm.schemaStorage = ss
-	rm.schemaStorage.SetLogger(rm.logger)
-
-	if rm.IsParserLoaded() {
-		rm.parser.SetSchemaReader(rm.schemaStorage)
-	}
-
-	return nil
-}
-
-func (rm *rootModule) findCompatibleLangParser() error {
+func (rm *rootModule) findCoreSchema() error {
 	defer func() {
-		rm.setParserLoaded(true)
+		rm.setCoreSchemaLoaded(true)
 	}()
 
 	if rm.tfVersion == nil {
-		return errors.New("unknown terraform version - unable to find parser")
+		return errors.New("unknown terraform version - unable to find schema")
 	}
 
-	p, err := lang.FindCompatibleParser(rm.tfVersion)
+	coreSchema, err := tfschema.CoreSchemaForVersion(rm.tfVersion)
 	if err != nil {
 		return err
 	}
-	p.SetLogger(rm.logger)
 
-	rm.parser = p
+	rm.coreSchema = coreSchema
 
-	return nil
-}
-
-func (rm *rootModule) ParseProviderReferences() error {
-	rm.providerRefsMu.Lock()
-	defer rm.providerRefsMu.Unlock()
-
-	mod, diags := tfconfig.LoadModuleFromFilesystem(rm.filesystem, rm.Path())
-	if diags.HasErrors() {
-		rm.logger.Printf("parsing provider references for %s failed: %s",
-			rm.Path(), diags.Error())
-	}
-	if mod == nil {
-		rm.logger.Printf("no provider references parsed for %s", rm.Path())
-		return nil
-	}
-
-	refs := make(addrs.ProviderReferences, 0)
-
-	rm.logger.Printf("%d provider references found for %s",
-		len(mod.RequiredProviders), rm.Path())
-
-	for name, rp := range mod.RequiredProviders {
-		if name == "" {
-			// skip unnamed inferred provider references
-			continue
-		}
-
-		lName, err := addrs.ParseProviderConfigCompactStr(name)
-		if err != nil {
-			return err
-		}
-		if rp.Source != "" {
-			pAddr, err := addrs.ParseProviderSourceString(rp.Source)
-			if err != nil {
-				return err
-			}
-			refs[lName] = pAddr
-		}
-	}
-
-	rm.providerRefs = refs
-
-	if rm.IsParserLoaded() {
-		rm.parserMu.Lock()
-		defer rm.parserMu.Unlock()
-		rm.parser.SetProviderReferences(rm.providerRefs)
+	if rm.IsDecoderReady() {
+		// files were already decoded without schema
+		// so we need to re-decode all files again
+		rm.DecodeFiles()
 	}
 
 	return nil
@@ -422,42 +352,93 @@ func (rm *rootModule) UpdateModuleManifest(lockFile File) error {
 	return nil
 }
 
-func (rm *rootModule) Parser() (lang.Parser, error) {
-	if !rm.IsParserLoaded() {
-		return nil, fmt.Errorf("parser is not loaded yet")
+func (rm *rootModule) Decoder() (*decoder.Decoder, error) {
+	if !rm.IsDecoderReady() {
+		return nil, fmt.Errorf("decoder is not ready yet")
 	}
-	rm.parserMu.RLock()
-	defer rm.parserMu.RUnlock()
+	rm.decoderMu.RLock()
+	defer rm.decoderMu.RUnlock()
 
-	if rm.parser == nil {
-		return nil, fmt.Errorf("no parser available")
+	if rm.decoder == nil {
+		return nil, fmt.Errorf("no decoder available")
 	}
 
-	return rm.parser, nil
+	return rm.decoder, nil
 }
 
-func (rm *rootModule) IsParserLoaded() bool {
-	rm.parserMu.RLock()
-	defer rm.parserMu.RUnlock()
-	return rm.parserLoaded
+func (rm *rootModule) IsDecoderReady() bool {
+	rm.decoderMu.RLock()
+	defer rm.decoderMu.RUnlock()
+	return rm.decoder != nil
 }
 
-func (rm *rootModule) setParserLoaded(isLoaded bool) {
-	rm.parserMu.Lock()
-	defer rm.parserMu.Unlock()
-	rm.parserLoaded = isLoaded
+func (rm *rootModule) IsCoreSchemaLoaded() bool {
+	rm.coreSchemaMu.RLock()
+	defer rm.coreSchemaMu.RUnlock()
+	return rm.coreSchemaLoaded
 }
 
-func (rm *rootModule) IsSchemaLoaded() bool {
-	rm.schemaLoadedMu.RLock()
-	defer rm.schemaLoadedMu.RUnlock()
-	return rm.schemaLoaded
+func (rm *rootModule) setCoreSchemaLoaded(isLoaded bool) {
+	rm.coreSchemaMu.Lock()
+	defer rm.coreSchemaMu.Unlock()
+	rm.coreSchemaLoaded = isLoaded
 }
 
-func (rm *rootModule) setSchemaLoaded(isLoaded bool) {
-	rm.schemaLoadedMu.Lock()
-	defer rm.schemaLoadedMu.Unlock()
-	rm.schemaLoaded = isLoaded
+func (rm *rootModule) IsProviderSchemaLoaded() bool {
+	rm.providerSchemaMu.RLock()
+	defer rm.providerSchemaMu.RUnlock()
+	return rm.providerSchema != nil
+}
+
+func (rm *rootModule) DecodeFiles() (hcl.Diagnostics, error) {
+	rm.decoderMu.Lock()
+	defer rm.decoderMu.Unlock()
+
+	var diags hcl.Diagnostics
+
+	files := make(map[string]*hcl.File, 0)
+	err := filepath.Walk(rm.Path(), func(path string, info os.FileInfo, err error) error {
+		src, err := ioutil.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		f, pDiags := hclsyntax.ParseConfig(src, info.Name(), hcl.InitialPos)
+		diags = append(diags, pDiags...)
+		if f != nil {
+			files[info.Name()] = f
+		}
+		return nil
+	})
+	if err != nil {
+		return diags, err
+	}
+
+	var bodySchema *schema.BodySchema
+	if rm.IsCoreSchemaLoaded() {
+		bodySchema = rm.coreSchema
+	}
+	if rm.IsProviderSchemaLoaded() {
+		s, mDiags := tfschema.MergeCoreWithJsonProviderSchemas(files, rm.coreSchema, rm.providerSchema)
+		diags = append(diags, mDiags...)
+		bodySchema = s
+	}
+
+	if rm.decoder == nil {
+		d, err := decoder.NewDecoder(bodySchema)
+		if err != nil {
+			return diags, err
+		}
+		rm.decoder = d
+	}
+
+	for name, f := range files {
+		err := rm.decoder.LoadFile(f, name)
+		if err != nil {
+			return diags, err
+		}
+	}
+
+	return diags, nil
 }
 
 func (rm *rootModule) ReferencesModulePath(path string) bool {
@@ -510,7 +491,7 @@ func (rm *rootModule) setTfLoaded(isLoaded bool) {
 	rm.tfLoaded = isLoaded
 }
 
-func (rm *rootModule) UpdateSchemaCache(ctx context.Context, lockFile File) error {
+func (rm *rootModule) UpdateProviderSchemaCache(ctx context.Context, lockFile File) error {
 	rm.pluginMu.Lock()
 	defer rm.pluginMu.Unlock()
 
@@ -518,17 +499,13 @@ func (rm *rootModule) UpdateSchemaCache(ctx context.Context, lockFile File) erro
 		return fmt.Errorf("cannot update schema as terraform executor is not available yet")
 	}
 
-	defer func() {
-		rm.setSchemaLoaded(true)
-	}()
-
 	if lockFile == nil {
 		rm.logger.Printf("ignoring schema cache update as no lock file was found for %s",
 			rm.Path())
 		return nil
 	}
 
-	if rm.schemaStorage == nil {
+	if rm.providerSchema == nil {
 		return fmt.Errorf("cannot update schema as schema cache is not available")
 	}
 
@@ -539,7 +516,9 @@ func (rm *rootModule) UpdateSchemaCache(ctx context.Context, lockFile File) erro
 		return err
 	}
 
-	return rm.schemaStorage.UpdateSchemas(ctx, schemas)
+	rm.providerSchema = schemas
+
+	return nil
 }
 
 func (rm *rootModule) PathsToWatch() []string {

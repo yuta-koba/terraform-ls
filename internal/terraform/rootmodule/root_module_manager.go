@@ -11,11 +11,10 @@ import (
 	"time"
 
 	"github.com/gammazero/workerpool"
+	"github.com/hashicorp/hcl-lang/decoder"
 	"github.com/hashicorp/terraform-config-inspect/tfconfig"
 	"github.com/hashicorp/terraform-ls/internal/terraform/discovery"
 	"github.com/hashicorp/terraform-ls/internal/terraform/exec"
-	"github.com/hashicorp/terraform-ls/internal/terraform/lang"
-	"github.com/hashicorp/terraform-ls/internal/terraform/schema"
 )
 
 type rootModuleManager struct {
@@ -75,7 +74,6 @@ func (rmm *rootModuleManager) defaultRootModuleFactory(ctx context.Context, dir 
 	d := &discovery.Discovery{}
 	rm.tfDiscoFunc = d.LookPath
 	rm.tfNewExecutor = exec.NewExecutor
-	rm.newSchemaStorage = schema.NewStorageForVersion
 
 	rm.tfExecPath = rmm.tfExecPath
 	rm.tfExecTimeout = rmm.tfExecTimeout
@@ -184,31 +182,31 @@ func (rmm *rootModuleManager) RootModuleByPath(path string) (RootModule, error) 
 	return nil, &RootModuleNotFoundErr{path}
 }
 
-func (rmm *rootModuleManager) ParserForDir(path string) (lang.Parser, error) {
+func (rmm *rootModuleManager) DecoderForDir(path string) (*decoder.Decoder, error) {
 	rm, err := rmm.RootModuleByPath(path)
 	if err != nil {
 		return nil, err
 	}
 
-	return rm.Parser()
+	return rm.Decoder()
 }
 
-func (rmm *rootModuleManager) IsParserLoaded(path string) (bool, error) {
+func (rmm *rootModuleManager) IsCoreSchemaLoaded(path string) (bool, error) {
 	rm, err := rmm.RootModuleByPath(path)
 	if err != nil {
 		return false, err
 	}
 
-	return rm.IsParserLoaded(), nil
+	return rm.IsCoreSchemaLoaded(), nil
 }
 
-func (rmm *rootModuleManager) IsSchemaLoaded(path string) (bool, error) {
+func (rmm *rootModuleManager) IsProviderSchemaLoaded(path string) (bool, error) {
 	rm, err := rmm.RootModuleByPath(path)
 	if err != nil {
 		return false, err
 	}
 
-	return rm.IsSchemaLoaded(), nil
+	return rm.IsProviderSchemaLoaded(), nil
 }
 
 func (rmm *rootModuleManager) TerraformFormatterForDir(ctx context.Context, path string) (exec.Formatter, error) {

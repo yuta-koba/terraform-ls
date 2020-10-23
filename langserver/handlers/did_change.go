@@ -64,13 +64,15 @@ func TextDocumentDidChange(ctx context.Context, params DidChangeTextDocumentPara
 	if err != nil {
 		return err
 	}
+
 	rms := cf.RootModuleCandidatesByPath(fh.Dir())
 	if len(rms) > 0 {
 		rm := rms[0]
-		err := rm.ParseProviderReferences()
+		_, err := rm.DecodeFiles()
 		if err != nil {
 			return err
 		}
+		// TODO: publish diags
 	}
 
 	return nil

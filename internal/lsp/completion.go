@@ -1,12 +1,12 @@
 package lsp
 
 import (
-	"github.com/hashicorp/hcl/v2"
-	"github.com/hashicorp/terraform-ls/internal/terraform/lang"
+	"github.com/hashicorp/hcl-lang/lang"
+	"github.com/hashicorp/terraform-ls/internal/mdplain"
 	lsp "github.com/sourcegraph/go-lsp"
 )
 
-func CompletionList(candidates lang.CompletionCandidates, pos hcl.Pos, caps lsp.TextDocumentClientCapabilities) lsp.CompletionList {
+func CompletionList(candidates lang.Candidates, caps lsp.TextDocumentClientCapabilities) lsp.CompletionList {
 	snippetSupport := caps.Completion.CompletionItem.SnippetSupport
 	list := lsp.CompletionList{}
 
@@ -14,58 +14,54 @@ func CompletionList(candidates lang.CompletionCandidates, pos hcl.Pos, caps lsp.
 		return list
 	}
 
-	cList := candidates.List()
-
 	list.IsIncomplete = !candidates.IsComplete()
-	list.Items = make([]lsp.CompletionItem, len(cList))
-	for i, c := range cList {
-		list.Items[i] = CompletionItem(c, pos, snippetSupport)
+	list.Items = make([]lsp.CompletionItem, len(candidates))
+	for i, c := range candidates {
+		list.Items[i] = CompletionItem(c, snippetSupport)
 	}
 
 	return list
 }
 
-func CompletionItem(candidate lang.CompletionCandidate, pos hcl.Pos, snippetSupport bool) lsp.CompletionItem {
-	// TODO: deprecated / tags?
-
-	doc := ""
-	if c := candidate.Documentation(); c != nil {
+func CompletionItem(candidate lang.Candidate, snippetSupport bool) lsp.CompletionItem {
+	doc := candidate.Description.Value
+	if candidate.Description.Kind == lang.MarkdownKind {
 		// TODO: markdown handling
-		doc = c.Value()
+		doc = mdplain.Clean(doc)
 	}
 
-	if snippetSupport {
-		return lsp.CompletionItem{
-			Label:            candidate.Label(),
-			Kind:             lsp.CIKField,
-			InsertTextFormat: lsp.ITFSnippet,
-			Detail:           candidate.Detail(),
-			Documentation:    doc,
-			TextEdit:         textEdit(candidate.Snippet(), pos),
-		}
+	var kind lsp.CompletionItemKind
+	switch candidate.Kind {
+	case lang.AttributeCandidateKind:
+		kind = lsp.CIKField
+	case lang.BlockCandidateKind:
+		kind = lsp.CIKClass
+	case lang.LabelCandidateKind:
+		kind = lsp.CIKConstant
 	}
+
+	te, format := textEdit(candidate.TextEdit, snippetSupport)
 
 	return lsp.CompletionItem{
-		Label:            candidate.Label(),
-		Kind:             lsp.CIKField,
-		InsertTextFormat: lsp.ITFPlainText,
-		Detail:           candidate.Detail(),
+		Label:            candidate.Label,
+		Kind:             kind,
+		InsertTextFormat: format,
+		Detail:           candidate.Detail,
 		Documentation:    doc,
-		TextEdit:         textEdit(candidate.PlainText(), pos),
+		TextEdit:         te,
 	}
 }
 
-func textEdit(te lang.TextEdit, pos hcl.Pos) *lsp.TextEdit {
-	rng := te.Range()
-	if rng == nil {
-		rng = &hcl.Range{
-			Start: pos,
-			End:   pos,
-		}
+func textEdit(te lang.TextEdit, snippetSupport bool) (*lsp.TextEdit, lsp.InsertTextFormat) {
+	if snippetSupport {
+		return &lsp.TextEdit{
+			NewText: te.Snippet,
+			Range:   HCLRangeToLSP(te.Range),
+		}, lsp.ITFSnippet
 	}
 
 	return &lsp.TextEdit{
-		NewText: te.NewText(),
-		Range:   HCLRangeToLSP(*rng),
-	}
+			NewText: te.RawText,
+			Range:   HCLRangeToLSP(te.Range),
+		}, lsp.ITFPlainText
 }

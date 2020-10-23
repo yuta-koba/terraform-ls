@@ -4,10 +4,9 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/hashicorp/hcl-lang/lang"
 	lsctx "github.com/hashicorp/terraform-ls/internal/context"
-	ihcl "github.com/hashicorp/terraform-ls/internal/hcl"
 	ilsp "github.com/hashicorp/terraform-ls/internal/lsp"
-	"github.com/hashicorp/terraform-ls/internal/terraform/lang"
 	"github.com/sourcegraph/go-lsp"
 )
 
@@ -19,7 +18,7 @@ func (h *logHandler) TextDocumentSymbol(ctx context.Context, params lsp.Document
 		return symbols, err
 	}
 
-	pf, err := lsctx.ParserFinder(ctx)
+	df, err := lsctx.DecoderFinder(ctx)
 	if err != nil {
 		return symbols, err
 	}
@@ -29,53 +28,46 @@ func (h *logHandler) TextDocumentSymbol(ctx context.Context, params lsp.Document
 		return symbols, err
 	}
 
-	text, err := file.Text()
-	if err != nil {
-		return symbols, err
-	}
-
-	hclFile := ihcl.NewFile(file, text)
-
-	// TODO: block until it's available <-pf.ParserLoadingDone()
+	// TODO: block until it's available <-df.ParserLoadingDone()
 	// requires https://github.com/hashicorp/terraform-ls/issues/8
 	// textDocument/documentSymbol fires early alongside textDocument/didOpen
 	// the protocol does not retry the request, so it's best to give the parser
 	// a moment
 	if err := Waiter(func() (bool, error) {
-		return pf.IsSchemaLoaded(file.Dir())
-	}).Waitf("parser is not available yet for %s", file.Dir()); err != nil {
+		return df.IsCoreSchemaLoaded(file.Dir())
+	}).Waitf("core schema is not available yet for %s", file.Dir()); err != nil {
 		return symbols, err
 	}
 
-	p, err := pf.ParserForDir(file.Dir())
+	d, err := df.DecoderForDir(file.Dir())
 	if err != nil {
-		return symbols, fmt.Errorf("finding compatible parser failed: %w", err)
+		return symbols, fmt.Errorf("finding compatible decoder failed: %w", err)
 	}
 
-	blocks, err := p.Blocks(hclFile)
+	sbs, err := d.Symbols()
 	if err != nil {
 		return symbols, err
 	}
+	for _, s := range sbs {
+		var kind lsp.SymbolKind
+		switch s.Kind() {
+		case lang.BlockSymbolKind:
+			kind = lsp.SKClass
+		case lang.AttributeSymbolKind:
+			kind = lsp.SKField
+		}
 
-	for _, block := range blocks {
 		symbols = append(symbols, lsp.SymbolInformation{
-			Name: symbolName(block),
-			Kind: lsp.SKClass, // most applicable kind for now
+			Name: s.Name(),
+			Kind: kind,
 			Location: lsp.Location{
-				Range: ilsp.HCLRangeToLSP(block.Range()),
+				Range: ilsp.HCLRangeToLSP(s.Range()),
 				URI:   params.TextDocument.URI,
 			},
+			// TODO: children
 		})
 	}
 
 	return symbols, nil
 
-}
-
-func symbolName(b lang.ConfigBlock) string {
-	name := b.BlockType()
-	for _, l := range b.Labels() {
-		name += "." + l.Value
-	}
-	return name
 }
